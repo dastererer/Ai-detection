@@ -1,0 +1,20 @@
+# Python environments and caches
+*.venv*
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Local editor and operating system files
+.idea/
+.junie/
+.DS_Store
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Generated datasets, checkpoints, and experiment artifacts
+ai_detection/

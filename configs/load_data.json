@@ -1,0 +1,34 @@
+{
+  "base_path": "drive/MyDrive/",
+  "save_models_folder": "ai_detection/models/",
+  "checkpoint_folder": "ai_detection/models/checkpoints/",
+  "save_model_priority": "f1",
+  "preprocess_folder": "ai_detection/data/processed/",
+  "models": [
+    "google-bert/bert-base-uncased",
+    "FacebookAI/roberta-base",
+    "answerdotai/ModernBERT-base"
+  ],
+  "datasets": {
+    "hc3": "Hello-SimpleAI/HC3",
+    "mage": "yaful/MAGE"
+},
+  "preprocess_batch_size": 128,
+  "features": [
+      "mtld", "yule_k", "hapax_ratio", "flesch",
+      "noun_ratio", "verb_ratio", "adjective_ratio",
+      "adverb_ratio", "function_word_ratio",
+      "sentence_length_mean", "sentence_length_std",
+      "parse_tree_depth_mean", "dependency_distance",
+      "dependent_clause_ratio", "coordination_index",
+      "passive_voice_ratio", "gunning_fog",
+      "clausal_density", "left_branching_ratio",
+      "character_bigram_entropy"
+  ],
+  "dataset_for_experiment": "HC3",
+  "batch_size": 16,
+  "epochs_num": 1,
+  "learning_rate": 1e-5,
+  "device": "cpu",
+  "fp16": false
+}
