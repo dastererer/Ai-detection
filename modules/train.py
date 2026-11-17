@@ -2,10 +2,12 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 import pandas as pd
+import json
+import matplotlib.pyplot as plt
 from modules.model import save_model
 from modules.tools import plot_metrics
 
-def evaluate(detector, loader, criterion):
+def evaluate(detector, loader, criterion, fp16=False):
     detector.eval()
     device = next(detector.parameters()).device
     with torch.no_grad():
@@ -18,11 +20,13 @@ def evaluate(detector, loader, criterion):
 
         for i, batch in enumerate(loader):
             labels = batch["label"].to(device)
-            logits = detector(
-                batch["encoding"].to(device),
-                batch["linguistic_features"].to(device) if batch["linguistic_features"] is not None else None,
-            )
-            loss = criterion(logits, labels)
+            with torch.autocast(device_type=device.type, dtype=torch.float16,
+                                enabled=fp16 and device.type == "cuda"):
+                logits = detector(
+                    batch["encoding"].to(device),
+                    batch["linguistic_features"].to(device) if batch["linguistic_features"] is not None else None,
+                )
+                loss = criterion(logits, labels)
             error_sum += loss.item() * labels.shape[0]
             sample_counter += labels.shape[0]
             predictions = logits.argmax(dim=1)
@@ -40,13 +44,29 @@ def evaluate(detector, loader, criterion):
     }
     return metrics
 
-def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, scaler, eval_step=None):
+def save_step_results(step_results, save_path=None):
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.mkdir(parents=True, exist_ok=True)
+        with open(save_path / "step_results.json", "w") as f:
+            json.dump(step_results, f, indent=2)
+
+    figure = plot_metrics(step_results, "step")
+    if save_path is not None:
+        figure.savefig(save_path / "step_performance.png")
+    plt.close(figure)
+    return figure
+
+
+def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, scaler, eval_step=None, step_results=None, start_step=0, epoch=1, save_path=None):
     detector.train()
     error_sum = 0
     sample_counter = 0
     device = next(detector.parameters()).device
-    step_res =[]
+    if step_results is None:
+        step_results = []
     figure_m = None
+    epoch_results = None
     for i, batch in tqdm(enumerate(loader_train), total=len(loader_train), desc="Training: ", smoothing=0.05):
 
         autocast = torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler.is_enabled())
@@ -68,28 +88,42 @@ def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, sc
         scaler.step(optimizer)
         scaler.update()
 
-        step = i + 1
+        step = start_step + i + 1
 
         if eval_step is not None and step % eval_step == 0:
-            evaluation_results = evaluate(
-                detector, loader_val, criterion
+            epoch_results = evaluate(
+                detector, loader_val, criterion, fp16=scaler.is_enabled()
             )
             detector.train()
 
 
             evaluation_results = {
                 "step": step,
+                "epoch": epoch,
                 "train_loss": error_sum / sample_counter,
                 **{
                     f"val_{name}": value
-                    for name, value in evaluation_results.items()
+                    for name, value in epoch_results.items()
                 },
             }
 
-            step_res.append(evaluation_results)
-            figure_m = plot_metrics(step_res, "step")
+            step_results.append(evaluation_results)
+            figure_m = save_step_results(step_results, save_path)
 
-    epoch_results = evaluate(detector, loader_val, criterion)
+    step = start_step + len(loader_train)
+    if eval_step is None or step % eval_step != 0:
+        epoch_results = evaluate(detector, loader_val, criterion, fp16=scaler.is_enabled())
+        step_results.append({
+            "step": step,
+            "epoch": epoch,
+            "train_loss": error_sum / sample_counter,
+            **{
+                f"val_{name}": value
+                for name, value in epoch_results.items()
+            },
+        })
+        figure_m = save_step_results(step_results, save_path)
+    detector.eval()
     return error_sum / sample_counter, epoch_results, figure_m
 
 def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16=False, priority="accuracy", save_path=None, checkpoints_dir=None, eval_step=1000):
@@ -108,6 +142,8 @@ def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16
         checkpoints_dir = Path(checkpoints_dir)
 
     results = []
+    step_results = []
+    detector.step_results = step_results
     best_epoch = None
     best_score = None
     best_state_dict = None
@@ -131,7 +167,11 @@ def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16
             optimizer=optimizer,
             criterion=criterion,
             eval_step=eval_step,
-            scaler = scaler
+            scaler = scaler,
+            step_results=step_results,
+            start_step=(epoch - 1) * len(loader_train),
+            epoch=epoch,
+            save_path=save_path,
         )
 
         results.append({
@@ -188,5 +228,19 @@ def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16
         f"\nBest epoch: {best_epoch} | "
         f"Validation {priority}: {best_score:.4f}"
     )
+
+    if step_results:
+        step_results_df = pd.DataFrame(step_results)
+        metric_column = f"val_{priority}"
+        if priority == "loss":
+            best_step_index = step_results_df[metric_column].idxmin()
+        else:
+            best_step_index = step_results_df[metric_column].idxmax()
+        best_step = step_results[best_step_index]
+        print(
+            f"Best evaluation step: {best_step['step']} | "
+            f"Epoch: {best_step['epoch']} | "
+            f"Validation {priority}: {best_step[metric_column]:.4f}"
+        )
 
     return detector, results
