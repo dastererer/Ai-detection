@@ -7,7 +7,30 @@ import matplotlib.pyplot as plt
 from modules.model import save_model
 from modules.tools import plot_metrics
 
-def evaluate(detector, loader, criterion, fp16=False):
+
+def _check_best_model(metrics, priority, model, best_metrics, best_state_dict, best_step, cur_step):
+    if best_metrics is None or best_state_dict is None:
+        is_better = True
+    elif priority == "loss":
+        is_better = metrics[priority] < best_metrics[priority]
+    else:
+        is_better = metrics[priority] > best_metrics[priority]
+
+    if is_better:
+        best_step = cur_step
+        best_metrics = metrics.copy()
+        best_state_dict = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in model.state_dict().items()
+        }
+
+    return best_metrics, best_state_dict, best_step
+
+
+
+
+
+def evaluate(detector, loader, criterion, best_metrics, best_state_dict, best_step, cur_step, fp16=False, priority="accuracy"):
     detector.eval()
     device = next(detector.parameters()).device
     with torch.no_grad():
@@ -35,6 +58,7 @@ def evaluate(detector, loader, criterion, fp16=False):
             tp += ((predictions == 1) & (labels == 1)).sum().item()
             fp += ((predictions == 1) & (labels == 0)).sum().item()
             fn += ((predictions == 0) & (labels == 1)).sum().item()
+
     metrics = {
         "loss": error_sum / sample_counter,
         "accuracy": correct / sample_counter,
@@ -42,7 +66,8 @@ def evaluate(detector, loader, criterion, fp16=False):
         "recall": tp / (tp + fn) if tp + fn > 0 else 0.0,
         "f1": 2 * tp / (2 * tp + fp + fn) if tp + fp + fn > 0 else 0.0
     }
-    return metrics
+    best_metrics, best_state_dict, best_step = _check_best_model(metrics, priority, detector, best_metrics, best_state_dict, best_step, cur_step)
+    return best_metrics, best_state_dict, best_step, metrics
 
 def save_step_results(step_results, save_path=None):
     if save_path is not None:
@@ -58,15 +83,14 @@ def save_step_results(step_results, save_path=None):
     return figure
 
 
-def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, scaler, eval_step=None, step_results=None, start_step=0, epoch=1, save_path=None):
+def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, scaler, best_metrics, best_state_dict, best_step, eval_step=None, step_results=None, start_step=0, epoch=1, save_path=None, priority="accuracy"):
     detector.train()
     error_sum = 0
     sample_counter = 0
     device = next(detector.parameters()).device
     if step_results is None:
         step_results = []
-    figure_m = None
-    epoch_results = None
+
     for i, batch in tqdm(enumerate(loader_train), total=len(loader_train), desc="Training: ", smoothing=0.05):
 
         autocast = torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler.is_enabled())
@@ -91,8 +115,8 @@ def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, sc
         step = start_step + i + 1
 
         if eval_step is not None and step % eval_step == 0:
-            epoch_results = evaluate(
-                detector, loader_val, criterion, fp16=scaler.is_enabled()
+            best_metrics, best_state_dict, best_step, step_result = evaluate(
+                detector, loader_val, criterion, best_metrics, best_state_dict, fp16=scaler.is_enabled(), best_step=best_step, cur_step=step, priority=priority
             )
             detector.train()
 
@@ -103,16 +127,29 @@ def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, sc
                 "train_loss": error_sum / sample_counter,
                 **{
                     f"val_{name}": value
-                    for name, value in epoch_results.items()
+                    for name, value in step_result.items()
                 },
             }
 
             step_results.append(evaluation_results)
-            figure_m = save_step_results(step_results, save_path)
 
     step = start_step + len(loader_train)
-    if eval_step is None or step % eval_step != 0:
-        epoch_results = evaluate(detector, loader_val, criterion, fp16=scaler.is_enabled())
+
+    if eval_step is not None and step % eval_step == 0:
+        epoch_results = step_result
+    else:
+        best_metrics, best_state_dict, best_step, epoch_results = evaluate(
+            detector,
+            loader_val,
+            criterion,
+            best_metrics,
+            best_state_dict,
+            best_step=best_step,
+            cur_step=step,
+            fp16=scaler.is_enabled(),
+            priority=priority
+        )
+
         step_results.append({
             "step": step,
             "epoch": epoch,
@@ -122,9 +159,11 @@ def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, sc
                 for name, value in epoch_results.items()
             },
         })
-        figure_m = save_step_results(step_results, save_path)
-    detector.eval()
-    return error_sum / sample_counter, epoch_results, figure_m
+
+    detector.train()
+
+
+    return error_sum / sample_counter, epoch_results, best_metrics, best_state_dict, best_step
 
 def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16=False, priority="accuracy", save_path=None, checkpoints_dir=None, eval_step=1000):
     valid_metrics = {"accuracy", "f1", "loss", "precision", "recall"}
@@ -144,9 +183,9 @@ def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16
     results = []
     step_results = []
     detector.step_results = step_results
-    best_epoch = None
-    best_score = None
+    best_metrics = None
     best_state_dict = None
+    best_step = None
 
     if fp16 and torch.cuda.is_available() and next(detector.parameters()).device.type == "cuda":
         print("Using FP16")
@@ -160,7 +199,7 @@ def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16
     for epoch in tqdm(range(1, epochs + 1), total=epochs, desc="Training_epoch: ", smoothing=0.05):
         print(f"\nEpoch {epoch}/{epochs}")
 
-        train_loss, epoch_results, results_figure = train_one_epoch(
+        train_loss, epoch_results, best_metrics, best_state_dict, best_step = train_one_epoch(
             detector=detector,
             loader_train=loader_train,
             loader_val=loader_val,
@@ -168,10 +207,14 @@ def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16
             criterion=criterion,
             eval_step=eval_step,
             scaler = scaler,
+            best_metrics=best_metrics,
+            best_state_dict=best_state_dict,
             step_results=step_results,
             start_step=(epoch - 1) * len(loader_train),
             epoch=epoch,
             save_path=save_path,
+            best_step=best_step,
+            priority=priority
         )
 
         results.append({
@@ -184,28 +227,9 @@ def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16
             "val_f1": epoch_results["f1"],
         })
 
-        plot_metrics(results, "epoch")
-
         print(f"Train loss: {train_loss:.4f}")
         print(f"Validation: {epoch_results}")
 
-        score = epoch_results[priority]
-
-        if best_score is None:
-            is_better = True
-        elif priority == "loss":
-            is_better = score < best_score
-        else:
-            is_better = score > best_score
-
-        if is_better:
-            best_score = score
-            best_epoch = epoch
-
-            best_state_dict = {
-                name: tensor.detach().cpu().clone()
-                for name, tensor in detector.state_dict().items()
-            }
 
         if checkpoints_dir is not None:
             save_model(
@@ -216,31 +240,16 @@ def train(epochs, detector, loader_train, loader_val, optimizer, criterion, fp16
     detector.load_state_dict(best_state_dict)
     detector.eval()
 
-    figure = plot_metrics(results, "epoch")
-    detector.performance = figure
     detector.results = results
 
 
     if save_path is not None:
         save_model(save_path, detector)
 
-    print(
-        f"\nBest epoch: {best_epoch} | "
-        f"Validation {priority}: {best_score:.4f}"
-    )
-
     if step_results:
-        step_results_df = pd.DataFrame(step_results)
-        metric_column = f"val_{priority}"
-        if priority == "loss":
-            best_step_index = step_results_df[metric_column].idxmin()
-        else:
-            best_step_index = step_results_df[metric_column].idxmax()
-        best_step = step_results[best_step_index]
         print(
-            f"Best evaluation step: {best_step['step']} | "
-            f"Epoch: {best_step['epoch']} | "
-            f"Validation {priority}: {best_step[metric_column]:.4f}"
+            f"Best evaluation step: {best_step} | "
+            f"Validation {priority}: {best_metrics[priority]:.4f}"
         )
 
     return detector, results

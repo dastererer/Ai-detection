@@ -13,13 +13,12 @@ def define_tokenizer(model_path):
     return AutoTokenizer.from_pretrained(model_path)
 
 class Detector(torch.nn.Module):
-    def __init__(self, model_path, tokenizer, max_token_length, device=None, preprocessor=None, feature_columns=None, performance=None, results=None):
+    def __init__(self, model_path, tokenizer, max_token_length, device=None, preprocessor=None, feature_columns=None, results=None):
         super().__init__()
         self.model = AutoModel.from_pretrained(model_path)
         self.model_path = model_path
         self.tokenizer = tokenizer
         self.preprocessor = preprocessor
-        self.performance = performance
         self.results = results
         if device is None:
             if torch.cuda.is_available():
@@ -79,9 +78,6 @@ def save_model(save_path, detector):
     if detector.preprocessor is not None:
         joblib.dump(detector.preprocessor, save_path / "preprocessor.joblib")
 
-    if detector.performance is not None:
-        performance_save_path = save_path / "performance.png"
-        detector.performance.savefig(performance_save_path)
     if detector.results is not None:
         results_save_path = save_path / "results.json"
         with open(results_save_path, "w") as f:
