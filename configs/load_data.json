@@ -5,13 +5,15 @@
   "save_model_priority": "f1",
   "preprocess_folder": "ai_detection/data/processed/",
   "models": [
-    "google-bert/bert-base-uncased",
-    "FacebookAI/roberta-base",
-    "answerdotai/ModernBERT-base"
+    "answerdotai/ModernBERT-large",
+    "chandar-lab/NeoBERT",
+    "google/bigbird-roberta-base",
+    "microsoft/deberta-v3-base"
   ],
   "datasets": {
     "hc3": "Hello-SimpleAI/HC3",
     "mage": "yaful/MAGE"
+
 },
   "preprocess_batch_size": 128,
   "features": [
@@ -25,10 +27,10 @@
       "clausal_density", "left_branching_ratio",
       "character_bigram_entropy"
   ],
-  "dataset_for_experiment": "HC3",
-  "batch_size": 16,
-  "epochs_num": 1,
+  "dataset_for_experiment": "MAGE",
+  "batch_size": 32,
+  "epochs_num": 2,
   "learning_rate": 1e-5,
-  "device": "cpu",
-  "fp16": false
+  "device": "cuda",
+  "fp16": true
 }
