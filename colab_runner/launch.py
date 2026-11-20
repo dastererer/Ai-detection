@@ -32,7 +32,10 @@ def bundle_code(path, config):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for folder in [ROOT / "colab_runner"]:
             for source in sorted(folder.glob("*.py")):
-                archive.write(source, source.relative_to(ROOT))
+                if source.name == "launch.py":
+                    archive.write(folder / "recovery" / "worker_launch.txt", source.relative_to(ROOT))
+                else:
+                    archive.write(source, source.relative_to(ROOT))
         archive.write(ROOT / "colab_runner" / "requirements.txt", "colab_runner/requirements.txt")
         archive.writestr("colab_runner/config.json", json.dumps(config))
 
@@ -59,7 +62,7 @@ def publish_summary(session, config, summary):
     ]))
 
 
-def run_queue(config, sessions, remote_root, folder):
+def run_queue(config, sessions, remote_root, folder, bundle=None, max_replacements=2):
     jobs = queue.Queue()
     for model in config["models"]:
         jobs.put(model)
@@ -67,24 +70,52 @@ def run_queue(config, sessions, remote_root, folder):
     lock = threading.Lock()
     hours = config["max_total_gpu_hours"] / len(sessions)
 
+    mount_lock = threading.Lock()
+
     def worker(session, allocated_at):
+        replacements = 0
+        session_gone = False
         safe_to_stop = True
         model = None
         deadline = allocated_at + hours * 3600
         try:
             while time.time() < deadline:
-                try:
-                    model = jobs.get_nowait()
-                except queue.Empty:
-                    break
+                if model is None:
+                    try:
+                        model = jobs.get_nowait()
+                    except queue.Empty:
+                        break
                 receipt = "receipt-" + uuid.uuid4().hex + ".json"
                 if model == "chandar-lab/NeoBERT":
                     execute(session, f"import subprocess, sys\nsubprocess.run([sys.executable, '-m', 'colab_runner.setup', '--neobert'], cwd={remote_root!r}, check=True)")
                 safe_to_stop = False
                 command = ["-m", "colab_runner.worker", "--model", model, "--deadline", str(deadline), "--receipt", "/content/" + receipt]
-                execute(session, f"import subprocess, sys\nsubprocess.run([sys.executable] + {command!r}, cwd={remote_root!r}, check=True)")
                 local_receipt = folder / receipt
-                colab(["download", "-s", session, "content/" + receipt, str(local_receipt)])
+                try:
+                    execute(session, f"import subprocess, sys\nsubprocess.run([sys.executable] + {command!r}, cwd={remote_root!r}, check=True)")
+                    colab(["download", "-s", session, "content/" + receipt, str(local_receipt)])
+                except subprocess.CalledProcessError:
+                    from colab_runner.recovery import recover, replace_session
+                    if bundle is None:
+                        raise
+                    print(f"Checking {session} before retrying {model}.", flush=True)
+                    state = recover(colab, session, receipt, local_receipt, min(deadline, time.time() + 300))
+                    if state == "gone":
+                        session_gone = True
+                        if replacements >= max_replacements:
+                            raise RuntimeError("Session replacement limit reached.")
+                        replacements += 1
+                        with mount_lock:
+                            session = replace_session(colab, config["gpu"], deadline)
+                            session_gone = False
+                            safe_to_stop = True
+                            print(f"Preparing replacement {session} for {model}. Drive consent may be required.", flush=True)
+                            prepare_session(session, bundle, remote_root)
+                        if time.time() >= deadline:
+                            raise RuntimeError("Time budget expired while preparing replacement.")
+                        continue
+                    if state != "finished":
+                        raise RuntimeError(f"Session state: {state}. Worker completion is unconfirmed.")
                 result = json.loads(local_receipt.read_text())
                 if result["model"] != model or not result["synced"]:
                     raise RuntimeError("Missing confirmation that results reached Google Drive.")
@@ -96,12 +127,15 @@ def run_queue(config, sessions, remote_root, folder):
                     (folder / "summary.json").write_text(json.dumps(summary, indent=2))
                     publish_summary(session, config, summary)
                 local_receipt.unlink()
+                model = None
         except Exception as error:
             with lock:
                 summary["errors"].append({"session": session, "model": model, "error": str(error)})
             print(f"Session {session} failed: {error}", flush=True)
         finally:
-            if safe_to_stop:
+            if session_gone:
+                print(f"Colab confirmed {session} is gone.", flush=True)
+            elif safe_to_stop:
                 try:
                     colab(["stop", "-s", session])
                 except Exception as error:
@@ -179,7 +213,7 @@ def main():
                 for session, _ in sessions:
                     colab(["stop", "-s", session])
                 raise
-            result = run_queue(config, sessions, remote_root, folder)
+            result = run_queue(config, sessions, remote_root, folder, bundle=bundle)
             print(json.dumps(result, indent=2))
             if result["errors"] or result["unstarted_models"] or result["unfinished_models"]:
                 raise SystemExit(1)
