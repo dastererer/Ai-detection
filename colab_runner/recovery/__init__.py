@@ -56,6 +56,7 @@ def replace_session(colab, gpu, deadline):
             return name
         except subprocess.CalledProcessError as error:
             output = error.stdout or ""
+            print(output.strip() or "Colab allocation failed without a diagnostic message.", flush=True)
             if "Allocation refused" not in output and "capacity limit" not in output:
                 raise
     raise RuntimeError("Replacement GPU unavailable within the remaining time budget.")

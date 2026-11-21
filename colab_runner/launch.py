@@ -51,20 +51,24 @@ def prepare_session(session, bundle, remote_root):
     ]))
 
 
-def publish_summary(session, config, summary):
-    path = str(Path(config["drive_project"]) / config["output_folder"] / config["run_name"] / "summary.json")
+def publish_summary(session, config, summary, filename="summary.json"):
+    path = str(Path(config["drive_project"]) / config["output_folder"] / config["run_name"] / filename)
     execute(session, "\n".join([
         "from pathlib import Path",
         f"summary_path = Path({path!r})",
-        "temporary = summary_path.with_name('summary.json.tmp')",
+        "temporary = summary_path.with_name(summary_path.name + '.tmp')",
         f"temporary.write_text({json.dumps(summary, indent=2, allow_nan=False)!r})",
         "temporary.replace(summary_path)",
     ]))
 
 
-def run_queue(config, sessions, remote_root, folder, bundle=None, max_replacements=2):
+def run_queue(config, sessions, remote_root, folder, bundle=None, max_replacements=2, selected_models=None):
     jobs = queue.Queue()
-    for model in config["models"]:
+    models = config["models"] if selected_models is None else selected_models
+    filename = "summary.json"
+    if models != config["models"]:
+        filename = "summary-from-" + models[0].replace("/", "--") + ".json"
+    for model in models:
         jobs.put(model)
     summary = {"models": [], "errors": [], "sessions_left_running": [], "unstarted_models": [], "unfinished_models": []}
     lock = threading.Lock()
@@ -124,8 +128,8 @@ def run_queue(config, sessions, remote_root, folder, bundle=None, max_replacemen
                     summary["models"].append(result)
                     if not result["all_variants_completed"]:
                         summary["unfinished_models"].append(model)
-                    (folder / "summary.json").write_text(json.dumps(summary, indent=2))
-                    publish_summary(session, config, summary)
+                    (folder / filename).write_text(json.dumps(summary, indent=2))
+                    publish_summary(session, config, summary, filename)
                 local_receipt.unlink()
                 model = None
         except Exception as error:
@@ -153,7 +157,7 @@ def run_queue(config, sessions, remote_root, folder, bundle=None, max_replacemen
             future.result()
     while not jobs.empty():
         summary["unstarted_models"].append(jobs.get_nowait())
-    (folder / "summary.json").write_text(json.dumps(summary, indent=2))
+    (folder / filename).write_text(json.dumps(summary, indent=2))
     return summary
 
 
@@ -163,8 +167,15 @@ def main():
     parser.add_argument("--prepare", metavar="CPU_SESSION")
     parser.add_argument("--sessions", nargs="+")
     parser.add_argument("--run", action="store_true")
+    parser.add_argument("--start-at", metavar="MODEL")
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text())
+    models = config["models"]
+    if args.start_at is not None:
+        if args.start_at not in models:
+            parser.error("Unknown starting model: " + args.start_at)
+        models = models[models.index(args.start_at):]
+        print("Selected queue:", ", ".join(models), flush=True)
     if not args.run and not args.prepare:
         print(json.dumps(config, indent=2))
         print("Plan only. No sessions allocated. Set drive_project, prepare an audited run, then use --run.")
@@ -192,7 +203,7 @@ def main():
                 return
             sessions = []
             try:
-                targets = args.sessions or ["ai-detection-" + uuid.uuid4().hex[:10] for _ in range(min(config["max_sessions"], len(config["models"])))]
+                targets = args.sessions or ["ai-detection-" + uuid.uuid4().hex[:10] for _ in range(min(config["max_sessions"], len(models)))]
                 for session in targets:
                     started = time.time()
                     if not args.sessions:
@@ -201,6 +212,7 @@ def main():
                             print(result.stdout, flush=True)
                         except subprocess.CalledProcessError as error:
                             output = error.stdout or ""
+                            print(output.strip() or "Colab allocation failed without a diagnostic message.", flush=True)
                             if sessions and ("Allocation refused" in output or "capacity limit" in output):
                                 print("Using the GPU sessions already allocated.", flush=True)
                                 break
@@ -213,7 +225,7 @@ def main():
                 for session, _ in sessions:
                     colab(["stop", "-s", session])
                 raise
-            result = run_queue(config, sessions, remote_root, folder, bundle=bundle)
+            result = run_queue(config, sessions, remote_root, folder, bundle=bundle, selected_models=models)
             print(json.dumps(result, indent=2))
             if result["errors"] or result["unstarted_models"] or result["unfinished_models"]:
                 raise SystemExit(1)
