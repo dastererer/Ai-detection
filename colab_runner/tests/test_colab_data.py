@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 from colab_runner.data import prepare_data, make_datasets
 from colab_runner.storage import copy_verified
-from colab_runner.launch import bundle_code, run_queue
+from colab_runner.launch import bundle_code, execute_worker, run_queue
 
 
 class Tokenizer:
@@ -54,8 +54,19 @@ class DataTests(unittest.TestCase):
             copy_verified(source, target)
             self.assertEqual(target.read_text(), "new")
 
+    def test_worker_error_reaches_kernel_output(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        output = StringIO()
+        with tempfile.TemporaryDirectory() as folder, redirect_stdout(output):
+            with patch("colab_runner.launch.execute", side_effect=lambda session, code: exec(code, {})):
+                with self.assertRaisesRegex(RuntimeError, "status 1: ValueError: worker diagnostic"):
+                    execute_worker("gpu", ["-c", "print('started'); raise ValueError('worker diagnostic')"], folder)
+        self.assertIn("started\nTraceback", output.getvalue())
+        self.assertIn("ValueError: worker diagnostic", output.getvalue())
+
     def test_queue_assigns_each_model_once_and_stops_successful_sessions(self):
-        import ast
         import time
         import threading
         config = {"models": ["model-a", "model-b", "model-c"], "max_total_gpu_hours": 1, "drive_project": "/content/drive/project", "output_folder": "runs", "run_name": "test"}
@@ -64,11 +75,7 @@ class DataTests(unittest.TestCase):
         stopped = []
         lock = threading.Lock()
 
-        def execute(session, code):
-            if "subprocess.run" not in code:
-                return
-            tree = ast.parse(code)
-            command = ast.literal_eval(tree.body[1].value.args[0].right)
+        def worker(session, command, remote_root):
             model = command[command.index("--model") + 1]
             name = Path(command[command.index("--receipt") + 1]).name
             with lock:
@@ -82,7 +89,7 @@ class DataTests(unittest.TestCase):
                 stopped.append(arguments[-1])
 
         with tempfile.TemporaryDirectory() as folder:
-            with patch("colab_runner.launch.execute", side_effect=execute), patch("colab_runner.launch.colab", side_effect=command):
+            with patch("colab_runner.launch.execute_worker", side_effect=worker), patch("colab_runner.launch.colab", side_effect=command):
                 result = run_queue(config, [("gpu-a", time.time()), ("gpu-b", time.time())], "/content/code", Path(folder))
         self.assertCountEqual(assigned, config["models"])
         self.assertCountEqual(stopped, ["gpu-a", "gpu-b"])

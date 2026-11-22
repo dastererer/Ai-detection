@@ -28,6 +28,22 @@ def execute(session, code):
     colab(["exec", "-s", session, "--timeout", "0"], code=code)
 
 
+def execute_worker(session, command, remote_root):
+    execute(session, "\n".join([
+        "import subprocess, sys",
+        f"worker_args = [sys.executable, '-u'] + {command!r}",
+        f"with subprocess.Popen(worker_args, cwd={remote_root!r}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace') as process:",
+        "    last_line = ''",
+        "    for line in process.stdout:",
+        "        print(line, end='', flush=True)",
+        "        if line.strip():",
+        "            last_line = line.strip()",
+        "    status = process.wait()",
+        "    if status:",
+        "        raise RuntimeError(f'Worker exited with status {status}: {last_line}')",
+    ]))
+
+
 def bundle_code(path, config):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for folder in [ROOT / "colab_runner"]:
@@ -96,7 +112,7 @@ def run_queue(config, sessions, remote_root, folder, bundle=None, max_replacemen
                 command = ["-m", "colab_runner.worker", "--model", model, "--deadline", str(deadline), "--receipt", "/content/" + receipt]
                 local_receipt = folder / receipt
                 try:
-                    execute(session, f"import subprocess, sys\nsubprocess.run([sys.executable] + {command!r}, cwd={remote_root!r}, check=True)")
+                    execute_worker(session, command, remote_root)
                     colab(["download", "-s", session, "content/" + receipt, str(local_receipt)])
                 except subprocess.CalledProcessError:
                     from colab_runner.recovery import recover, replace_session
