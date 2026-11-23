@@ -27,10 +27,48 @@ def _check_best_model(metrics, priority, model, best_metrics, best_state_dict, b
     return best_metrics, best_state_dict, best_step
 
 
+def evaluate(detector, loader, criterion, fp16=False):
+    detector.eval()
+    device = next(detector.parameters()).device
+    detector.eval()
+    device = next(detector.parameters()).device
+    with torch.no_grad():
+        error_sum = 0
+        sample_counter = 0
+        correct = 0
+        tp = 0
+        fp = 0
+        fn = 0
+
+        for i, batch in enumerate(loader):
+            labels = batch["label"].to(device)
+            with torch.autocast(device_type=device.type, dtype=torch.float16,
+                                enabled=fp16 and device.type == "cuda"):
+                logits = detector(
+                    batch["encoding"].to(device),
+                    batch["linguistic_features"].to(device) if batch["linguistic_features"] is not None else None,
+                )
+                loss = criterion(logits, labels)
+            error_sum += loss.item() * labels.shape[0]
+            sample_counter += labels.shape[0]
+            predictions = logits.argmax(dim=1)
+            correct += (predictions == labels).sum().item()
+            labels = labels
+            tp += ((predictions == 1) & (labels == 1)).sum().item()
+            fp += ((predictions == 1) & (labels == 0)).sum().item()
+            fn += ((predictions == 0) & (labels == 1)).sum().item()
+
+    metrics = {
+        "loss": error_sum / sample_counter,
+        "accuracy": correct / sample_counter,
+        "precision": tp / (tp + fp) if tp + fp > 0 else 0.0,
+        "recall": tp / (tp + fn) if tp + fn > 0 else 0.0,
+        "f1": 2 * tp / (2 * tp + fp + fn) if tp + fp + fn > 0 else 0.0
+    }
+    return metrics
 
 
-
-def evaluate(detector, loader, criterion, best_metrics, best_state_dict, best_step, cur_step, fp16=False, priority="accuracy"):
+def _evaluate(detector, loader, criterion, best_metrics, best_state_dict, best_step, cur_step, fp16=False, priority="accuracy"):
     detector.eval()
     device = next(detector.parameters()).device
     with torch.no_grad():
@@ -115,7 +153,7 @@ def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, sc
         step = start_step + i + 1
 
         if eval_step is not None and step % eval_step == 0:
-            best_metrics, best_state_dict, best_step, step_result = evaluate(
+            best_metrics, best_state_dict, best_step, step_result = _evaluate(
                 detector, loader_val, criterion, best_metrics, best_state_dict, fp16=scaler.is_enabled(), best_step=best_step, cur_step=step, priority=priority
             )
             detector.train()
@@ -138,7 +176,7 @@ def train_one_epoch(detector, loader_train, loader_val, optimizer, criterion, sc
     if eval_step is not None and step % eval_step == 0:
         epoch_results = step_result
     else:
-        best_metrics, best_state_dict, best_step, epoch_results = evaluate(
+        best_metrics, best_state_dict, best_step, epoch_results = _evaluate(
             detector,
             loader_val,
             criterion,
