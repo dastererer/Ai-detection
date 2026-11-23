@@ -27,6 +27,7 @@
       "clausal_density", "left_branching_ratio",
       "character_bigram_entropy"
   ],
+  "detector_type": "linear",
   "dataset_for_experiment": "MAGE",
   "batch_size": 32,
   "epochs_num": 2,

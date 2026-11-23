@@ -10,7 +10,7 @@ from modules.tools import normalize
 
 
 def define_tokenizer(model_path):
-    return AutoTokenizer.from_pretrained(model_path)
+    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
 class Detector(torch.nn.Module):
     def __init__(self, model_path, tokenizer, max_token_length, device=None, preprocessor=None, feature_columns=None, results=None):
@@ -34,7 +34,6 @@ class Detector(torch.nn.Module):
         else:
             self.feature_columns = feature_columns
             self.detection_layer = torch.nn.Linear(self.model.config.hidden_size + len(feature_columns), 2)
-
 
     def forward(self, encoding, linguistic_features=None):
 
@@ -60,6 +59,54 @@ class Detector(torch.nn.Module):
             logits = self.detection_layer(combined_features)
 
         return logits
+
+class HybridDetector(torch.nn.Module):
+    def __init__(self, model_path, tokenizer, max_token_length, feature_columns, preprocessor, device=None,
+                 results=None):
+        super().__init__()
+        self.model = AutoModel.from_pretrained(model_path)
+        self.model_path = model_path
+        self.tokenizer = tokenizer
+        self.preprocessor = preprocessor
+        self.results = results
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = device
+
+        self.max_token_length = max_token_length
+        self.feature_columns = feature_columns
+
+        combined_size = self.model.config.hidden_size + len(feature_columns)
+        intermediate_size = combined_size // 2
+
+        self.detection_layer = torch.nn.Sequential(
+            torch.nn.Linear(combined_size, intermediate_size),
+            torch.nn.LayerNorm(intermediate_size),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(intermediate_size, 2)
+        )
+
+    def forward(self, encoding, linguistic_features):
+
+        if linguistic_features is None:
+            raise ValueError("HybridDetector requires linguistic_features.")
+
+        outputs = self.model(**encoding)
+
+        hidden = outputs.last_hidden_state
+
+        cls_embeddings = hidden[:, 0, :]
+
+        combined_features = torch.cat([cls_embeddings, linguistic_features], dim=1)
+        logits = self.detection_layer(combined_features)
+
+        return logits
+
 
 def save_model(save_path, detector):
     save_path = Path(save_path)
@@ -90,7 +137,11 @@ def save_model(save_path, detector):
 
     return save_path
 
-def load_model(saved_model_path):
+def load_model(saved_model_path, model_type):
+
+    if model_type not in ["hybrid", "linear"]:
+        raise IOError("model_type must be either 'hybrid' or 'linear'")
+
     saved_model_path = Path(saved_model_path)
 
     saved_model = saved_model_path / "model.pt"
@@ -109,12 +160,22 @@ def load_model(saved_model_path):
             raise IOError(f"Preprocessor file is missing for a model with linguistic features")
         preprocessor = None
 
-    detector = Detector(
-    model_path=model_path,
-    feature_columns=features,
-    tokenizer=tokenizer,
-    preprocessor=preprocessor,
-    max_token_length=max_token_length)
+    if model_type == "hybrid":
+        if features is None:
+            raise ValueError("Cannot load a hybrid model from a checkpoint without linguistic features.")
+        detector = HybridDetector(
+        model_path=model_path,
+        feature_columns=features,
+        tokenizer=tokenizer,
+        preprocessor=preprocessor,
+        max_token_length=max_token_length)
+    elif model_type == "linear":
+        detector = Detector(
+        model_path=model_path,
+        feature_columns=features,
+        tokenizer=tokenizer,
+        preprocessor=preprocessor,
+        max_token_length=max_token_length)
 
     state_dict = torch.load(
         saved_model,
